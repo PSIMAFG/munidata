@@ -6,6 +6,7 @@ import ContractTypePage from './pages/ContractTypePage';
 import AuditPage from './pages/AuditPage';
 import RecordsPage from './pages/RecordsPage';
 import SetupPage from './pages/SetupPage';
+import ProjectsPage from './pages/ProjectsPage';
 
 export default function App() {
   return (
@@ -13,6 +14,7 @@ export default function App() {
       <Route element={<AppLayout />}>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/setup" element={<SetupPage />} />
+        <Route path="/projects" element={<ProjectsPage />} />
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/convenios" element={<ConveniosPage />} />
         <Route path="/calidad" element={<ContractTypePage />} />

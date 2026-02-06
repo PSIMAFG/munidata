@@ -36,3 +36,27 @@ class AuditConfig(BaseModel):
     municipality_code: str
     year: int = 2025
     threshold_pct: float = Field(default=5.0, ge=0, le=100)
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+    municipality_code: str
+    area: str = "Salud"
+    year: int = 2025
+    months: list[int] = Field(default_factory=lambda: list(range(1, 13)))
+    contract_types: list[str] = Field(
+        default_factory=lambda: ["HONORARIOS", "CONTRATA", "PLANTA"]
+    )
+    convenios: list[str] = Field(default_factory=list)
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    municipality_code: Optional[str] = None
+    area: Optional[str] = None
+    year: Optional[int] = None
+    months: Optional[list[int]] = None
+    contract_types: Optional[list[str]] = None
+    convenios: Optional[list[str]] = None

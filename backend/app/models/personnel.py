@@ -152,6 +152,22 @@ class RemunerationScale(Base):
     )
 
 
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    municipality_code = Column(String(10), nullable=False, index=True)
+    area = Column(String(50), nullable=False, default="Salud")
+    year = Column(Integer, nullable=False)
+    months = Column(JSON, nullable=True)
+    contract_types = Column(JSON, nullable=True)
+    convenios = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 class AuditException(Base):
     __tablename__ = "audit_exceptions"
 

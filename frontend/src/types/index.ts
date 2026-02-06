@@ -126,6 +126,32 @@ export interface ScrapeRun {
   created_at: string;
 }
 
+export interface Project {
+  id: number;
+  name: string;
+  description: string | null;
+  municipality_code: string;
+  area: string;
+  year: number;
+  months: number[];
+  contract_types: string[];
+  convenios: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectDeleteResult {
+  detail: string;
+  deleted: {
+    honorarios: number;
+    contrata: number;
+    planta: number;
+    escalas: number;
+    audit_exceptions: number;
+    scrape_runs: number;
+  };
+}
+
 export const MONTH_NAMES: Record<number, string> = {
   1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril',
   5: 'Mayo', 6: 'Junio', 7: 'Julio', 8: 'Agosto',

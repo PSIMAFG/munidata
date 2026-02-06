@@ -3,7 +3,7 @@ import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { Layout, Menu, Typography } from 'antd';
 import {
   DashboardOutlined, SettingOutlined, AuditOutlined,
-  TableOutlined, FundOutlined, TeamOutlined,
+  TableOutlined, FundOutlined, TeamOutlined, DatabaseOutlined,
 } from '@ant-design/icons';
 import FilterPanel from '../filters/FilterPanel';
 
@@ -11,6 +11,7 @@ const { Header, Sider, Content } = Layout;
 
 const menuItems = [
   { key: '/setup', icon: <SettingOutlined />, label: 'Setup' },
+  { key: '/projects', icon: <DatabaseOutlined />, label: 'Proyectos' },
   { key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
   { key: '/convenios', icon: <FundOutlined />, label: 'Convenios' },
   { key: '/calidad', icon: <TeamOutlined />, label: 'Calidad Contractual' },

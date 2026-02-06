@@ -1,14 +1,44 @@
-"""Playwright-based scraper for Portal Transparencia Chile."""
-import os
+"""Playwright-based scraper for Portal Transparencia Chile.
+
+Targets the real Transparencia Activa pages at:
+  https://www.portaltransparencia.cl/PortalPdT/pdtta?codOrganismo=MU{code}
+
+The portal runs on Liferay/JSF with heavy AJAX rendering.
+Strategy:
+  1. Navigate with Playwright, wait for JSF to settle
+  2. Expand section "04. Personal y remuneraciones"
+  3. Click into sub-sections (honorarios / contrata / planta)
+  4. Extract paginated HTML tables
+  5. Resilience: multiple selector fallbacks, generous timeouts, retries
+"""
+
 import csv
 import io
-import re
-import time
+import json
+import os
 import logging
+import time
 from pathlib import Path
-from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PwTimeout
+
+from playwright.sync_api import (
+    sync_playwright,
+    Page,
+    Browser,
+    Locator,
+    TimeoutError as PwTimeout,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PORTAL_BASE = (
+    "https://www.portaltransparencia.cl/PortalPdT/pdtta"
+)
+
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 
 MONTH_NAMES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
@@ -16,22 +46,111 @@ MONTH_NAMES = {
     9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
 
-PORTAL_BASE = "https://www.portaltransparencia.cl/PortalPdT/directorio-de-organismos-regulados/"
+# Default navigation / AJAX timeout (Liferay is slow)
+NAV_TIMEOUT = 60_000   # 60 s
+AJAX_TIMEOUT = 45_000  # 45 s
+CLICK_DELAY = 2        # seconds to sleep after clicks for JSF re-render
 
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Selector banks (tried in order; first match wins)
+# ---------------------------------------------------------------------------
+
+SECTION_PERSONAL_SELECTORS = [
+    "text=04. Personal y remuneraciones",
+    "text=Personal y remuneraciones",
+    "li:has-text('Personal y remuneraciones') >> a",
+    "a:has-text('Personal y remuneraciones')",
+    "span:has-text('Personal y remuneraciones')",
+    "text=04.",
+    "[class*='personal']",
+    "a[title*='Personal']",
+]
+
+HONORARIOS_SELECTORS = [
+    "text=Personas naturales contratadas a honorarios",
+    "a:has-text('Personas naturales contratadas a honorarios')",
+    "text=honorarios",
+    "a:has-text('Honorarios')",
+    "li:has-text('honorarios') >> a",
+    "text=Dotación a Honorarios",
+]
+
+CONTRATA_SELECTORS = [
+    "text=Personal a Contrata",
+    "a:has-text('Personal a Contrata')",
+    "text=contrata",
+    "a:has-text('Contrata')",
+    "li:has-text('contrata') >> a",
+    "text=Dotación a contrata",
+]
+
+PLANTA_SELECTORS = [
+    "text=Personal de Planta",
+    "a:has-text('Personal de Planta')",
+    "text=planta",
+    "a:has-text('Planta')",
+    "li:has-text('planta') >> a",
+    "text=Dotación de planta",
+]
+
+ESCALAS_SELECTORS = [
+    "text=Escala de remuneraciones",
+    "a:has-text('Escala de remuneraciones')",
+    "a:has-text('Escala')",
+    "span:has-text('Escala')",
+]
+
+NEXT_PAGE_SELECTORS = [
+    "a:has-text('Siguiente')",
+    ".paginate_button.next:not(.disabled)",
+    "a:has-text('>>')",
+    "li.next:not(.disabled) a",
+    "button:has-text('Siguiente')",
+    "a.ui-paginator-next:not(.ui-state-disabled)",
+    ".ui-paginator-next:not(.ui-state-disabled)",
+    "span.ui-paginator-next:not(.ui-state-disabled)",
+]
+
+TABLE_SELECTORS = [
+    "table.tabla-datos",
+    "table.dataTable",
+    "table[id*='tabla']",
+    "table.table",
+    "table[role='grid']",
+    "div.ui-datatable table",
+    ".ui-datatable-tablewrapper table",
+]
 
 
 class PortalScraper:
+    """Scrapes personnel data from Portal Transparencia Chile."""
+
     def __init__(self, org_code: str):
+        """
+        Args:
+            org_code: Organization code, e.g. "MU280" for San Antonio.
+        """
         self.org_code = org_code
         self.pw = sync_playwright().start()
         self.browser: Browser = self.pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
         )
         self.context = self.browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
             viewport={"width": 1920, "height": 1080},
+            java_script_enabled=True,
         )
         self.page: Page = self.context.new_page()
         self.raw_dir = Path(DATA_DIR) / "raw" / org_code
@@ -44,100 +163,393 @@ class PortalScraper:
         except Exception:
             pass
 
-    def _navigate_to_org(self):
-        url = f"{PORTAL_BASE}?org={self.org_code}"
-        logger.info(f"Navigating to {url}")
-        self.page.goto(url, wait_until="networkidle", timeout=60000)
-        time.sleep(2)
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
 
     def _screenshot(self, name: str):
+        """Save a debug screenshot."""
         try:
             path = self.raw_dir / f"screenshot_{name}.png"
-            self.page.screenshot(path=str(path))
+            self.page.screenshot(path=str(path), full_page=True)
             logger.info(f"Screenshot saved: {path}")
         except Exception as e:
             logger.warning(f"Screenshot failed: {e}")
 
-    def _try_download_csv(self, section_name: str, area: str, year: int, month: int) -> list[dict] | None:
-        """Attempt to find and click CSV download button. Returns parsed records or None."""
+    def _save_html(self, name: str):
+        """Save raw HTML of the current page for debugging."""
         try:
-            download_btns = self.page.locator("a:has-text('Descargar'), button:has-text('CSV'), a:has-text('CSV'), a[href*='.csv']")
-            if download_btns.count() > 0:
-                with self.page.expect_download(timeout=30000) as download_info:
-                    download_btns.first.click()
-                download = download_info.value
-                file_path = self.raw_dir / f"{section_name}_{year}_{month:02d}.csv"
-                download.save_as(str(file_path))
-                logger.info(f"CSV downloaded: {file_path}")
-                return self._parse_csv(file_path)
-        except (PwTimeout, Exception) as e:
-            logger.warning(f"CSV download failed for {section_name} {month}: {e}")
+            path = self.raw_dir / f"html_{name}.html"
+            html = self.page.content()
+            path.write_text(html, encoding="utf-8")
+            logger.info(f"HTML saved: {path} ({len(html)} bytes)")
+        except Exception as e:
+            logger.warning(f"HTML save failed: {e}")
+
+    def _wait_for_ajax(self, timeout_ms: int = AJAX_TIMEOUT):
+        """Wait for Liferay/JSF AJAX to settle."""
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except PwTimeout:
+            logger.debug("networkidle timed out, continuing anyway")
+        # Extra sleep for JSF re-render
+        time.sleep(CLICK_DELAY)
+
+    def _try_click(self, selectors: list[str], description: str) -> bool:
+        """Try each selector in order; click the first visible match.
+
+        Returns True if a click succeeded.
+        """
+        for sel in selectors:
+            try:
+                loc = self.page.locator(sel)
+                # Filter to visible elements only
+                for i in range(loc.count()):
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        logger.info(f"Clicking '{description}' via selector: {sel} (match {i})")
+                        el.scroll_into_view_if_needed()
+                        time.sleep(0.5)
+                        el.click()
+                        self._wait_for_ajax()
+                        return True
+            except Exception as e:
+                logger.debug(f"Selector '{sel}' for '{description}' failed: {e}")
+                continue
+        logger.warning(f"No selector matched for '{description}'")
+        return False
+
+    def _try_select_option(self, label: str, value: str) -> bool:
+        """Try to select a value from a <select> or click a link/tab.
+
+        The portal may use native <select>, JSF <select>, tabs, or links
+        for area/year/month filters.
+        """
+        selectors = [
+            # Native <select> by label text
+            f"select:near(:text('{label}'))",
+            # Any <select> containing the option
+            f"select:has(option:has-text('{value}'))",
+            # Link / tab
+            f"a:has-text('{value}')",
+            f"li:has-text('{value}') >> a",
+            f"span:has-text('{value}')",
+            # PrimeFaces selectOneMenu
+            f"div[class*='selectonemenu']:near(:text('{label}'))",
+        ]
+
+        # First try native <select>
+        for sel in selectors[:2]:
+            try:
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    tag = loc.first.evaluate("el => el.tagName")
+                    if tag and tag.upper() == "SELECT":
+                        loc.first.select_option(label=value)
+                        logger.info(f"Selected '{value}' in <select> for '{label}'")
+                        self._wait_for_ajax()
+                        return True
+            except Exception as e:
+                logger.debug(f"Select option '{value}' via '{sel}' failed: {e}")
+
+        # Try PrimeFaces selectOneMenu (click trigger, then click option in panel)
+        try:
+            trigger = self.page.locator(
+                f"div[class*='selectonemenu']:near(:text('{label}')) .ui-selectonemenu-trigger"
+            )
+            if trigger.count() > 0 and trigger.first.is_visible():
+                trigger.first.click()
+                time.sleep(1)
+                option = self.page.locator(f"li[data-label='{value}'], li:has-text('{value}')")
+                if option.count() > 0 and option.first.is_visible():
+                    option.first.click()
+                    logger.info(f"Selected '{value}' via PrimeFaces menu for '{label}'")
+                    self._wait_for_ajax()
+                    return True
+        except Exception as e:
+            logger.debug(f"PrimeFaces select for '{label}' failed: {e}")
+
+        # Fallback: click any visible link/tab with the value text
+        for sel in selectors[2:]:
+            try:
+                loc = self.page.locator(sel)
+                for i in range(min(loc.count(), 5)):
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        el.click()
+                        logger.info(f"Clicked '{value}' for '{label}' via '{sel}'")
+                        self._wait_for_ajax()
+                        return True
+            except Exception as e:
+                logger.debug(f"Click '{value}' via '{sel}' failed: {e}")
+
+        logger.warning(f"Could not select '{value}' for filter '{label}'")
+        return False
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+
+    def _navigate_to_org(self):
+        """Navigate to the Transparencia Activa page for this organization."""
+        url = f"{PORTAL_BASE}?codOrganismo={self.org_code}"
+        logger.info(f"Navigating to {url}")
+        self.page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        self._wait_for_ajax()
+        self._screenshot("01_org_home")
+        self._save_html("01_org_home")
+
+    def _expand_personal_section(self) -> bool:
+        """Find and expand '04. Personal y remuneraciones'."""
+        clicked = self._try_click(SECTION_PERSONAL_SELECTORS, "Personal y remuneraciones")
+        self._screenshot("02_personal_section")
+        if not clicked:
+            self._save_html("02_personal_section_FAIL")
+        return clicked
+
+    def _click_subsection(self, selectors: list[str], name: str) -> bool:
+        """Click into a personnel sub-section (honorarios/contrata/planta)."""
+        clicked = self._try_click(selectors, name)
+        self._screenshot(f"03_{name[:15]}")
+        if not clicked:
+            self._save_html(f"03_{name[:15]}_FAIL")
+        return clicked
+
+    def _apply_filters(self, area: str, year: int, month: int | None = None):
+        """Apply area / year / month filters on the current view."""
+        # Area
+        if area:
+            self._try_select_option("Área", area)
+            self._try_select_option("Area", area)  # without accent
+            self._screenshot("04_area_selected")
+
+        # Year
+        self._try_select_option("Año", str(year))
+        self._try_select_option("Periodo", str(year))
+        self._screenshot("05_year_selected")
+
+        # Month
+        if month:
+            month_name = MONTH_NAMES.get(month, str(month))
+            self._try_select_option("Mes", month_name)
+            self._try_select_option("Periodo", month_name)
+            self._screenshot(f"06_month_{month:02d}")
+
+    def _navigate_to_section(
+        self,
+        subsection_selectors: list[str],
+        subsection_name: str,
+        area: str,
+        year: int,
+        month: int | None = None,
+    ):
+        """Full navigation: org page -> personal section -> subsection -> filters."""
+        self._navigate_to_org()
+        self._expand_personal_section()
+        self._click_subsection(subsection_selectors, subsection_name)
+        self._apply_filters(area, year, month)
+        self._screenshot(f"07_ready_{subsection_name[:10]}_{year}_{month}")
+        self._save_html(f"07_ready_{subsection_name[:10]}_{year}_{month}")
+
+    # ------------------------------------------------------------------
+    # Table extraction (Level 2)
+    # ------------------------------------------------------------------
+
+    def _find_data_table(self) -> Locator | None:
+        """Find the main data table on the page using multiple selectors."""
+        # Try specific selectors first
+        for sel in TABLE_SELECTORS:
+            try:
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return loc.first
+            except Exception:
+                continue
+
+        # Fallback: any visible <table> with more than 5 rows
+        try:
+            tables = self.page.locator("table:visible")
+            for i in range(tables.count()):
+                tbl = tables.nth(i)
+                rows = tbl.locator("tr")
+                if rows.count() > 5:
+                    logger.info(f"Using generic table (index {i}) with {rows.count()} rows")
+                    return tbl
+        except Exception:
+            pass
+
         return None
 
-    def _extract_table_data(self, max_pages: int = 50) -> list[dict]:
-        """Fallback: extract data from HTML table with pagination."""
-        all_records = []
-        for page_num in range(max_pages):
+    def _extract_headers(self, table: Locator) -> list[str]:
+        """Extract column headers from a table."""
+        headers = []
+
+        # Try <thead> <th>
+        ths = table.locator("thead th")
+        if ths.count() > 0:
+            for i in range(ths.count()):
+                headers.append(ths.nth(i).inner_text().strip())
+            if headers:
+                return headers
+
+        # Try <thead> <td>
+        tds = table.locator("thead td")
+        if tds.count() > 0:
+            for i in range(tds.count()):
+                headers.append(tds.nth(i).inner_text().strip())
+            if headers:
+                return headers
+
+        # Try first <tr> cells as headers
+        first_row = table.locator("tr").first
+        cells = first_row.locator("th, td")
+        for i in range(cells.count()):
+            headers.append(cells.nth(i).inner_text().strip())
+
+        return headers
+
+    def _extract_rows(self, table: Locator, headers: list[str]) -> list[dict]:
+        """Extract data rows from a table given headers."""
+        records = []
+        rows = table.locator("tbody tr")
+        if rows.count() == 0:
+            # No <tbody>, skip first row (headers) and use all <tr>
+            all_rows = table.locator("tr")
+            row_start = 1  # skip header row
+            for i in range(row_start, all_rows.count()):
+                cells = all_rows.nth(i).locator("td")
+                record = {}
+                for j in range(min(cells.count(), len(headers))):
+                    text = cells.nth(j).inner_text().strip()
+                    record[headers[j]] = text
+                if any(record.values()):
+                    records.append(record)
+        else:
+            for i in range(rows.count()):
+                cells = rows.nth(i).locator("td")
+                record = {}
+                for j in range(min(cells.count(), len(headers))):
+                    text = cells.nth(j).inner_text().strip()
+                    record[headers[j]] = text
+                if any(record.values()):
+                    records.append(record)
+        return records
+
+    def _has_next_page(self) -> bool:
+        """Check if there is a clickable 'Next' button."""
+        for sel in NEXT_PAGE_SELECTORS:
             try:
-                table = self.page.locator("table.tabla-datos, table.dataTable, table[id*='tabla'], table.table")
-                if table.count() == 0:
-                    table = self.page.locator("table").first
-                if table.count() == 0:
-                    break
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible() and loc.first.is_enabled():
+                    return True
+            except Exception:
+                continue
+        return False
 
-                headers = []
-                ths = table.locator("thead th, thead td")
-                for i in range(ths.count()):
-                    headers.append(ths.nth(i).inner_text().strip())
+    def _click_next_page(self) -> bool:
+        """Click the 'Next' pagination button. Returns True if successful."""
+        for sel in NEXT_PAGE_SELECTORS:
+            try:
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible() and loc.first.is_enabled():
+                    loc.first.click()
+                    self._wait_for_ajax()
+                    return True
+            except Exception:
+                continue
+        return False
 
-                if not headers:
-                    first_row = table.locator("tr").first
-                    tds = first_row.locator("td, th")
-                    for i in range(tds.count()):
-                        headers.append(tds.nth(i).inner_text().strip())
+    def _extract_table_data(self, max_pages: int = 100) -> list[dict]:
+        """Extract all data from the current paginated HTML table.
 
-                rows = table.locator("tbody tr")
-                for i in range(rows.count()):
-                    cells = rows.nth(i).locator("td")
-                    record = {}
-                    for j in range(min(cells.count(), len(headers))):
-                        record[headers[j]] = cells.nth(j).inner_text().strip()
-                    if record:
-                        all_records.append(record)
+        Handles pagination by clicking 'Next' until no more pages.
+        """
+        all_records = []
+        headers = None
 
-                # Try pagination
-                next_btn = self.page.locator(
-                    "a:has-text('Siguiente'), button:has-text('Siguiente'), "
-                    "a:has-text('>>'), .paginate_button.next:not(.disabled), "
-                    "li.next:not(.disabled) a"
-                )
-                if next_btn.count() > 0 and next_btn.first.is_visible():
-                    next_btn.first.click()
-                    self.page.wait_for_load_state("networkidle", timeout=15000)
-                    time.sleep(1)
-                else:
-                    break
-            except Exception as e:
-                logger.warning(f"Table extraction page {page_num} error: {e}")
+        for page_num in range(max_pages):
+            table = self._find_data_table()
+            if table is None:
+                if page_num == 0:
+                    logger.warning("No data table found on page")
+                    self._screenshot("no_table_found")
+                    self._save_html("no_table_found")
                 break
 
+            # Get headers from first page only
+            if headers is None:
+                headers = self._extract_headers(table)
+                if not headers:
+                    logger.warning("Could not extract table headers")
+                    break
+                logger.info(f"Table headers ({len(headers)}): {headers[:5]}...")
+
+            page_records = self._extract_rows(table, headers)
+            if not page_records:
+                break
+
+            all_records.extend(page_records)
+            logger.info(f"Page {page_num + 1}: extracted {len(page_records)} rows (total: {len(all_records)})")
+
+            # Try to go to next page
+            if not self._click_next_page():
+                break
+
+        logger.info(f"Total records extracted from table: {len(all_records)}")
         return all_records
 
+    # ------------------------------------------------------------------
+    # CSV download attempt
+    # ------------------------------------------------------------------
+
+    def _try_download_csv(self, section_name: str, area: str, year: int, month: int) -> list[dict] | None:
+        """Look for a CSV/Excel download button and parse the result."""
+        download_selectors = [
+            "a:has-text('Descargar')",
+            "button:has-text('CSV')",
+            "a:has-text('CSV')",
+            "a[href*='.csv']",
+            "a:has-text('Exportar')",
+            "button:has-text('Exportar')",
+        ]
+        for sel in download_selectors:
+            try:
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    with self.page.expect_download(timeout=30_000) as download_info:
+                        loc.first.click()
+                    download = download_info.value
+                    file_path = self.raw_dir / f"{section_name}_{year}_{month:02d}.csv"
+                    download.save_as(str(file_path))
+                    logger.info(f"CSV downloaded: {file_path}")
+                    return self._parse_csv(file_path)
+            except PwTimeout:
+                logger.debug(f"Download via '{sel}' timed out")
+            except Exception as e:
+                logger.debug(f"Download via '{sel}' failed: {e}")
+        return None
+
     def _parse_csv(self, file_path: Path) -> list[dict]:
-        """Parse a CSV file with robust encoding handling."""
+        """Parse CSV with robust encoding handling (Chilean portals use Latin-1 often)."""
         for encoding in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
             try:
                 with open(file_path, "r", encoding=encoding) as f:
                     content = f.read()
-                reader = csv.DictReader(io.StringIO(content), delimiter=";")
-                records = []
-                for row in reader:
-                    records.append(dict(row))
-                if records:
-                    return records
+                # Try semicolon delimiter first (standard in Chilean CSV), then comma
+                for delimiter in [";", ",", "\t"]:
+                    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+                    records = [dict(row) for row in reader]
+                    if records and len(records[0]) > 1:
+                        logger.info(f"Parsed CSV ({encoding}, delim='{delimiter}'): {len(records)} records")
+                        return records
             except (UnicodeDecodeError, csv.Error):
                 continue
+        logger.warning(f"Could not parse CSV: {file_path}")
         return []
+
+    # ------------------------------------------------------------------
+    # Normalization (maps raw column names to standard DB fields)
+    # ------------------------------------------------------------------
 
     def _normalize_honorarios(self, raw_records: list[dict]) -> list[dict]:
         """Normalize raw honorarios records to standard field names."""
@@ -174,7 +586,7 @@ class PortalScraper:
         return normalized
 
     def _normalize_contrata_planta(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize contrata/planta records."""
+        """Normalize contrata/planta records to standard field names."""
         normalized = []
         for raw in raw_records:
             rec = {}
@@ -209,161 +621,157 @@ class PortalScraper:
             normalized.append(rec)
         return normalized
 
-    def _navigate_to_section(self, section_text: str, area: str, year: int, month: int = None):
-        """Navigate to a specific section in the portal."""
-        self._navigate_to_org()
-        self._screenshot(f"org_home")
+    # ------------------------------------------------------------------
+    # Scrape with retry logic (Level 3: resilience)
+    # ------------------------------------------------------------------
 
-        # Click on "Personal y remuneraciones"
-        try:
-            personal_link = self.page.locator(
-                "a:has-text('Personal y remuneraciones'), "
-                "a:has-text('04'), "
-                "span:has-text('Personal y remuneraciones')"
-            )
-            if personal_link.count() > 0:
-                personal_link.first.click()
-                self.page.wait_for_load_state("networkidle", timeout=30000)
-                time.sleep(2)
-        except Exception as e:
-            logger.warning(f"Click 'Personal y remuneraciones' failed: {e}")
+    def _scrape_with_retry(
+        self,
+        subsection_selectors: list[str],
+        subsection_name: str,
+        normalizer,
+        area: str,
+        year: int,
+        month: int,
+    ) -> list[dict]:
+        """Attempt to scrape a section with retries and fallbacks.
 
-        self._screenshot(f"personal_section")
+        Strategy:
+        1. Navigate to the correct section
+        2. Try CSV download
+        3. Fallback: extract HTML table
+        4. Retry up to MAX_RETRIES times on failure
+        """
+        label = f"{subsection_name} {year}/{month:02d}"
 
-        # Click on section (e.g., "Personas naturales contratadas a honorarios")
-        try:
-            section_link = self.page.locator(f"a:has-text('{section_text}'), span:has-text('{section_text}')")
-            if section_link.count() > 0:
-                section_link.first.click()
-                self.page.wait_for_load_state("networkidle", timeout=30000)
-                time.sleep(2)
-        except Exception as e:
-            logger.warning(f"Click section '{section_text}' failed: {e}")
-
-        self._screenshot(f"section_{section_text[:20]}")
-
-        # Select area (e.g., "Salud")
-        try:
-            area_select = self.page.locator(
-                f"select option:has-text('{area}'), "
-                f"a:has-text('{area}'), "
-                f"li:has-text('{area}')"
-            )
-            if area_select.count() > 0:
-                area_select.first.click()
-                self.page.wait_for_load_state("networkidle", timeout=15000)
-                time.sleep(1)
-        except Exception as e:
-            logger.warning(f"Select area '{area}' failed: {e}")
-
-        # Select year
-        try:
-            year_select = self.page.locator(
-                f"select option:has-text('{year}'), "
-                f"a:has-text('{year}'), "
-                f"li:has-text('{year}')"
-            )
-            if year_select.count() > 0:
-                year_select.first.click()
-                self.page.wait_for_load_state("networkidle", timeout=15000)
-                time.sleep(1)
-        except Exception as e:
-            logger.warning(f"Select year '{year}' failed: {e}")
-
-        # Select month if specified
-        if month:
-            month_name = MONTH_NAMES.get(month, str(month))
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                month_select = self.page.locator(
-                    f"select option:has-text('{month_name}'), "
-                    f"a:has-text('{month_name}'), "
-                    f"li:has-text('{month_name}')"
-                )
-                if month_select.count() > 0:
-                    month_select.first.click()
-                    self.page.wait_for_load_state("networkidle", timeout=15000)
-                    time.sleep(1)
-            except Exception as e:
-                logger.warning(f"Select month '{month_name}' failed: {e}")
+                logger.info(f"Scraping {label} (attempt {attempt}/{MAX_RETRIES})")
 
-        self._screenshot(f"ready_{section_text[:10]}_{year}_{month}")
+                self._navigate_to_section(
+                    subsection_selectors=subsection_selectors,
+                    subsection_name=subsection_name,
+                    area=area,
+                    year=year,
+                    month=month,
+                )
+
+                # Level 1: Try CSV download
+                records = self._try_download_csv(subsection_name, area, year, month)
+                if records:
+                    logger.info(f"{label}: got {len(records)} records via CSV")
+                    return normalizer(records)
+
+                # Level 2: Extract HTML table
+                logger.info(f"{label}: no CSV, extracting HTML table")
+                raw = self._extract_table_data()
+                if raw:
+                    logger.info(f"{label}: got {len(raw)} records from HTML table")
+                    return normalizer(raw)
+
+                # No data found
+                logger.warning(f"{label}: no data found on attempt {attempt}")
+                self._screenshot(f"no_data_{subsection_name[:10]}_{year}_{month:02d}_att{attempt}")
+                self._save_html(f"no_data_{subsection_name[:10]}_{year}_{month:02d}_att{attempt}")
+
+                if attempt < MAX_RETRIES:
+                    wait = 5 * attempt
+                    logger.info(f"Retrying in {wait}s...")
+                    time.sleep(wait)
+
+            except PwTimeout as e:
+                logger.error(f"{label}: timeout on attempt {attempt}: {e}")
+                self._screenshot(f"timeout_{subsection_name[:10]}_{month:02d}_att{attempt}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(5 * attempt)
+            except Exception as e:
+                logger.error(f"{label}: error on attempt {attempt}: {e}")
+                self._screenshot(f"error_{subsection_name[:10]}_{month:02d}_att{attempt}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(5 * attempt)
+
+        logger.error(f"{label}: all {MAX_RETRIES} attempts exhausted, returning empty")
+        return []
+
+    # ------------------------------------------------------------------
+    # Public API (same interface as before)
+    # ------------------------------------------------------------------
 
     def scrape_honorarios(self, area: str, year: int, month: int) -> list[dict]:
-        """Scrape honorarios for a specific month."""
-        self._navigate_to_section(
-            section_text="Personas naturales contratadas a honorarios",
-            area=area, year=year, month=month,
+        """Scrape 'Personas naturales contratadas a honorarios' for one month."""
+        return self._scrape_with_retry(
+            subsection_selectors=HONORARIOS_SELECTORS,
+            subsection_name="honorarios",
+            normalizer=self._normalize_honorarios,
+            area=area,
+            year=year,
+            month=month,
         )
-
-        # Try CSV download first
-        records = self._try_download_csv("honorarios", area, year, month)
-        if records:
-            return self._normalize_honorarios(records)
-
-        # Fallback: extract table
-        logger.info(f"Falling back to table extraction for honorarios {year}/{month}")
-        raw = self._extract_table_data()
-        return self._normalize_honorarios(raw)
 
     def scrape_contrata(self, area: str, year: int, month: int) -> list[dict]:
-        """Scrape contrata for a specific month."""
-        self._navigate_to_section(
-            section_text="Personal a Contrata",
-            area=area, year=year, month=month,
+        """Scrape 'Personal a Contrata' for one month."""
+        return self._scrape_with_retry(
+            subsection_selectors=CONTRATA_SELECTORS,
+            subsection_name="contrata",
+            normalizer=self._normalize_contrata_planta,
+            area=area,
+            year=year,
+            month=month,
         )
-
-        records = self._try_download_csv("contrata", area, year, month)
-        if records:
-            return self._normalize_contrata_planta(records)
-
-        logger.info(f"Falling back to table extraction for contrata {year}/{month}")
-        raw = self._extract_table_data()
-        return self._normalize_contrata_planta(raw)
 
     def scrape_planta(self, area: str, year: int, month: int) -> list[dict]:
-        """Scrape planta for a specific month."""
-        self._navigate_to_section(
-            section_text="Personal de Planta",
-            area=area, year=year, month=month,
+        """Scrape 'Personal de Planta' for one month."""
+        return self._scrape_with_retry(
+            subsection_selectors=PLANTA_SELECTORS,
+            subsection_name="planta",
+            normalizer=self._normalize_contrata_planta,
+            area=area,
+            year=year,
+            month=month,
         )
 
-        records = self._try_download_csv("planta", area, year, month)
-        if records:
-            return self._normalize_contrata_planta(records)
-
-        logger.info(f"Falling back to table extraction for planta {year}/{month}")
-        raw = self._extract_table_data()
-        return self._normalize_contrata_planta(raw)
-
     def scrape_escalas(self, year: int):
-        """Download remuneration scale Excel files."""
-        self._navigate_to_org()
-
+        """Download remuneration scale files (Excel/PDF)."""
         try:
-            escala_link = self.page.locator(
-                "a:has-text('Escala de remuneraciones'), "
-                "a:has-text('escala'), "
-                "span:has-text('Escala')"
-            )
-            if escala_link.count() > 0:
-                escala_link.first.click()
-                self.page.wait_for_load_state("networkidle", timeout=30000)
-                time.sleep(2)
+            self._navigate_to_org()
+            self._expand_personal_section()
+            self._click_subsection(ESCALAS_SELECTORS, "Escala de remuneraciones")
 
-            # Try to find Excel downloads
-            excel_links = self.page.locator(
-                "a[href*='.xlsx'], a[href*='.xls'], "
-                "a:has-text('Descargar'), a:has-text('Excel')"
-            )
-            for i in range(min(excel_links.count(), 5)):
+            # Try year filter
+            self._try_select_option("Año", str(year))
+
+            self._screenshot(f"escalas_{year}")
+
+            # Try to download files
+            download_selectors = [
+                "a[href*='.xlsx']",
+                "a[href*='.xls']",
+                "a:has-text('Descargar')",
+                "a:has-text('Excel')",
+                "a[href*='.pdf']",
+            ]
+            downloaded = 0
+            for sel in download_selectors:
                 try:
-                    with self.page.expect_download(timeout=30000) as dl:
-                        excel_links.nth(i).click()
-                    download = dl.value
-                    file_path = self.raw_dir / f"escala_{year}_{i}.xlsx"
-                    download.save_as(str(file_path))
-                    logger.info(f"Escala downloaded: {file_path}")
+                    loc = self.page.locator(sel)
+                    for i in range(min(loc.count(), 5)):
+                        el = loc.nth(i)
+                        if el.is_visible():
+                            with self.page.expect_download(timeout=30_000) as dl:
+                                el.click()
+                            download = dl.value
+                            ext = download.suggested_filename.split(".")[-1] if "." in download.suggested_filename else "xlsx"
+                            file_path = self.raw_dir / f"escala_{year}_{downloaded}.{ext}"
+                            download.save_as(str(file_path))
+                            logger.info(f"Escala downloaded: {file_path}")
+                            downloaded += 1
                 except Exception as e:
-                    logger.warning(f"Escala download {i} failed: {e}")
+                    logger.debug(f"Escala download via '{sel}' failed: {e}")
+
+            if downloaded == 0:
+                logger.warning(f"No escala files downloaded for year {year}")
+                self._save_html(f"escalas_{year}_no_downloads")
+
         except Exception as e:
             logger.error(f"Escalas scraping failed: {e}")
+            self._screenshot(f"escalas_error_{year}")

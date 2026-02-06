@@ -18,8 +18,10 @@ import json
 import os
 import logging
 import time
+import re
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import (
     sync_playwright,
     Page,
@@ -503,31 +505,182 @@ class PortalScraper:
     # ------------------------------------------------------------------
 
     def _try_download_csv(self, section_name: str, area: str, year: int, month: int) -> list[dict] | None:
-        """Look for a CSV/Excel download button and parse the result."""
+        """Look for a CSV/Excel download button and parse the result.
+
+        Strategy:
+        1. Try direct href CSV/Excel links via HTTP download (fastest)
+        2. Try Playwright click-based download with multiple selectors
+        """
+        # --- Strategy 1: Find direct download links and fetch via HTTP ---
+        direct_records = self._try_direct_link_download(section_name, year, month)
+        if direct_records:
+            return direct_records
+
+        # --- Strategy 2: Click-based download via Playwright ---
         download_selectors = [
+            # Portal Transparencia common buttons
             "a:has-text('Descargar')",
+            "a:has-text('Descargar CSV')",
+            "a:has-text('Descargar Excel')",
+            "button:has-text('Descargar')",
+            # CSV specific
             "button:has-text('CSV')",
             "a:has-text('CSV')",
             "a[href*='.csv']",
+            # Export buttons
             "a:has-text('Exportar')",
             "button:has-text('Exportar')",
+            "a:has-text('Exportar a CSV')",
+            "a:has-text('Exportar a Excel')",
+            # PrimeFaces/Liferay export components
+            "a[class*='ui-export']",
+            "button[class*='export']",
+            "a[class*='export']",
+            ".ui-datatable-export a",
+            "a[href*='export']",
+            # Icon-based buttons (some portals use icons)
+            "a[title*='Descargar']",
+            "a[title*='CSV']",
+            "a[title*='Excel']",
+            "a[title*='Exportar']",
+            "button[title*='Descargar']",
+            # Generic download links
+            "a[href*='.xlsx']",
+            "a[href*='.xls']",
+            "a[download]",
         ]
         for sel in download_selectors:
             try:
                 loc = self.page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
+                    logger.info(f"Trying CSV download via selector: {sel}")
                     with self.page.expect_download(timeout=30_000) as download_info:
                         loc.first.click()
                     download = download_info.value
-                    file_path = self.raw_dir / f"{section_name}_{year}_{month:02d}.csv"
+                    suggested = download.suggested_filename or ""
+                    ext = suggested.rsplit(".", 1)[-1].lower() if "." in suggested else "csv"
+                    file_path = self.raw_dir / f"{section_name}_{year}_{month:02d}.{ext}"
                     download.save_as(str(file_path))
-                    logger.info(f"CSV downloaded: {file_path}")
+                    logger.info(f"CSV downloaded via click: {file_path} (suggested: {suggested})")
                     return self._parse_csv(file_path)
             except PwTimeout:
                 logger.debug(f"Download via '{sel}' timed out")
             except Exception as e:
                 logger.debug(f"Download via '{sel}' failed: {e}")
         return None
+
+    def _try_direct_link_download(self, section_name: str, year: int, month: int) -> list[dict] | None:
+        """Find direct href links on page and download via HTTP requests."""
+        try:
+            # Extract all links from the page that look like data downloads
+            links = self.page.evaluate("""() => {
+                const anchors = document.querySelectorAll('a[href]');
+                return Array.from(anchors)
+                    .map(a => ({href: a.href, text: a.innerText.trim()}))
+                    .filter(a => {
+                        const h = a.href.toLowerCase();
+                        const t = a.text.toLowerCase();
+                        return h.endsWith('.csv') || h.endsWith('.xlsx') || h.endsWith('.xls')
+                            || h.includes('export') || h.includes('descargar')
+                            || h.includes('download') || h.includes('csv')
+                            || t.includes('csv') || t.includes('descargar')
+                            || t.includes('exportar') || t.includes('excel');
+                    });
+            }""")
+
+            if not links:
+                logger.debug("No direct download links found on page")
+                return None
+
+            # Get cookies from Playwright session to use in HTTP request
+            cookies = self.context.cookies()
+            cookie_jar = httpx.Cookies()
+            for c in cookies:
+                cookie_jar.set(c["name"], c["value"], domain=c.get("domain", ""))
+
+            client = httpx.Client(
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
+                cookies=cookie_jar,
+                follow_redirects=True,
+                timeout=30.0,
+            )
+
+            for link in links:
+                href = link.get("href", "")
+                if not href or href.startswith("javascript:"):
+                    continue
+                try:
+                    logger.info(f"Trying direct HTTP download: {href[:100]}...")
+                    resp = client.get(href)
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        content_type = resp.headers.get("Content-Type", "").lower()
+                        if any(ct in content_type for ct in ["csv", "text", "excel", "spreadsheet", "octet-stream"]):
+                            ext = "csv"
+                            if "excel" in content_type or "spreadsheet" in content_type:
+                                ext = "xlsx"
+                            file_path = self.raw_dir / f"{section_name}_{year}_{month:02d}_direct.{ext}"
+                            file_path.write_bytes(resp.content)
+                            logger.info(f"Direct HTTP download successful: {file_path} ({len(resp.content)} bytes)")
+                            records = self._parse_csv(file_path)
+                            if records:
+                                client.close()
+                                return records
+                except Exception as e:
+                    logger.debug(f"Direct download from {href[:80]} failed: {e}")
+                    continue
+
+            client.close()
+
+        except Exception as e:
+            logger.debug(f"Direct link extraction failed: {e}")
+        return None
+
+    def _extract_from_raw_html(self) -> list[dict]:
+        """Fallback: parse table data directly from page HTML source."""
+        try:
+            html = self.page.content()
+            # Find all tables in the HTML
+            table_pattern = re.compile(r'<table[^>]*>(.*?)</table>', re.DOTALL | re.IGNORECASE)
+            tables = table_pattern.findall(html)
+
+            for table_html in tables:
+                # Extract headers
+                header_pattern = re.compile(r'<th[^>]*>(.*?)</th>', re.DOTALL | re.IGNORECASE)
+                headers_raw = header_pattern.findall(table_html)
+                headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers_raw]
+
+                if len(headers) < 3:
+                    continue
+
+                # Extract rows
+                row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
+                cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+                rows = row_pattern.findall(table_html)
+
+                records = []
+                for row_html in rows:
+                    cells_raw = cell_pattern.findall(row_html)
+                    cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells_raw]
+                    if len(cells) >= len(headers) and any(cells):
+                        record = {}
+                        for j, header in enumerate(headers):
+                            if j < len(cells):
+                                record[header] = cells[j]
+                        records.append(record)
+
+                if len(records) > 2:
+                    logger.info(f"Raw HTML parsing found table with {len(headers)} cols, {len(records)} rows")
+                    return records
+
+        except Exception as e:
+            logger.debug(f"Raw HTML parsing failed: {e}")
+        return []
 
     def _parse_csv(self, file_path: Path) -> list[dict]:
         """Parse CSV with robust encoding handling (Chilean portals use Latin-1 often)."""
@@ -662,11 +815,18 @@ class PortalScraper:
                     logger.info(f"{label}: got {len(records)} records via CSV")
                     return normalizer(records)
 
-                # Level 2: Extract HTML table
+                # Level 2: Extract HTML table via Playwright
                 logger.info(f"{label}: no CSV, extracting HTML table")
                 raw = self._extract_table_data()
                 if raw:
                     logger.info(f"{label}: got {len(raw)} records from HTML table")
+                    return normalizer(raw)
+
+                # Level 3: Parse raw HTML source for table data
+                logger.info(f"{label}: no Playwright table, trying raw HTML parsing")
+                raw = self._extract_from_raw_html()
+                if raw:
+                    logger.info(f"{label}: got {len(raw)} records from raw HTML")
                     return normalizer(raw)
 
                 # No data found

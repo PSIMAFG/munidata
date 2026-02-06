@@ -1,6 +1,7 @@
 """Synchronous scrape pipeline executed by Celery worker."""
 import datetime
 import logging
+import traceback
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from app.config import get_settings
@@ -26,6 +27,8 @@ def execute_scrape_pipeline(scrape_run_id: int) -> dict:
 
         total_loaded = 0
         org_code = f"MU{int(run.municipality_code):03d}"
+        scraper = None
+        errors = []
 
         try:
             scraper = PortalScraper(org_code=org_code)
@@ -33,42 +36,59 @@ def execute_scrape_pipeline(scrape_run_id: int) -> dict:
 
             for kind in kinds:
                 kind_lower = kind.lower()
-                if kind_lower == "honorarios":
-                    total_loaded += _scrape_honorarios(
-                        db, scraper, run, org_code
-                    )
-                elif kind_lower == "contrata":
-                    total_loaded += _scrape_contrata(
-                        db, scraper, run, org_code
-                    )
-                elif kind_lower == "planta":
-                    total_loaded += _scrape_planta(
-                        db, scraper, run, org_code
-                    )
-                elif kind_lower == "escalas":
-                    _scrape_escalas(db, scraper, run, org_code)
+                try:
+                    if kind_lower == "honorarios":
+                        total_loaded += _scrape_honorarios(
+                            db, scraper, run, org_code
+                        )
+                    elif kind_lower == "contrata":
+                        total_loaded += _scrape_contrata(
+                            db, scraper, run, org_code
+                        )
+                    elif kind_lower == "planta":
+                        total_loaded += _scrape_planta(
+                            db, scraper, run, org_code
+                        )
+                    elif kind_lower == "escalas":
+                        _scrape_escalas(db, scraper, run, org_code)
+                except Exception as e:
+                    error_msg = f"Error scraping {kind_lower}: {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+                    continue
 
-            run.status = ScrapeRunStatus.COMPLETED
+            if total_loaded > 0 or not errors:
+                run.status = ScrapeRunStatus.COMPLETED
+            else:
+                run.status = ScrapeRunStatus.FAILED
             run.records_loaded = total_loaded
             run.completed_at = datetime.datetime.utcnow()
+            if errors:
+                run.error_message = "; ".join(errors)[:2000]
             db.commit()
 
-            scraper.close()
-            return {"status": "completed", "records_loaded": total_loaded}
+            return {"status": run.status.value.lower(), "records_loaded": total_loaded, "errors": errors}
 
         except Exception as e:
             logger.exception(f"Scrape pipeline failed: {e}")
             run.status = ScrapeRunStatus.FAILED
-            run.error_message = str(e)[:2000]
+            run.error_message = f"{str(e)[:1500]}\n{traceback.format_exc()[-500:]}"
             run.completed_at = datetime.datetime.utcnow()
             db.commit()
             return {"status": "failed", "error": str(e)}
+        finally:
+            if scraper:
+                try:
+                    scraper.close()
+                except Exception:
+                    pass
 
 
 def _scrape_honorarios(db: Session, scraper: PortalScraper, run: ScrapeRun, org_code: str) -> int:
     count = 0
     for month in run.months:
         try:
+            logger.info(f"Scraping honorarios month {month} for {run.municipality_code}")
             records = scraper.scrape_honorarios(
                 area=run.area, year=run.year, month=month
             )
@@ -94,9 +114,9 @@ def _scrape_honorarios(db: Session, scraper: PortalScraper, run: ScrapeRun, org_
                 db.add(hon)
                 count += 1
             db.commit()
-            logger.info(f"Honorarios month {month}: {len(records)} records")
+            logger.info(f"Honorarios month {month}: {len(records)} records loaded")
         except Exception as e:
-            logger.error(f"Error scraping honorarios month {month}: {e}")
+            logger.error(f"Error scraping honorarios month {month}: {e}", exc_info=True)
             db.rollback()
     return count
 
@@ -105,6 +125,7 @@ def _scrape_contrata(db: Session, scraper: PortalScraper, run: ScrapeRun, org_co
     count = 0
     for month in run.months:
         try:
+            logger.info(f"Scraping contrata month {month} for {run.municipality_code}")
             records = scraper.scrape_contrata(
                 area=run.area, year=run.year, month=month
             )
@@ -132,9 +153,9 @@ def _scrape_contrata(db: Session, scraper: PortalScraper, run: ScrapeRun, org_co
                 db.add(cont)
                 count += 1
             db.commit()
-            logger.info(f"Contrata month {month}: {len(records)} records")
+            logger.info(f"Contrata month {month}: {len(records)} records loaded")
         except Exception as e:
-            logger.error(f"Error scraping contrata month {month}: {e}")
+            logger.error(f"Error scraping contrata month {month}: {e}", exc_info=True)
             db.rollback()
     return count
 
@@ -143,6 +164,7 @@ def _scrape_planta(db: Session, scraper: PortalScraper, run: ScrapeRun, org_code
     count = 0
     for month in run.months:
         try:
+            logger.info(f"Scraping planta month {month} for {run.municipality_code}")
             records = scraper.scrape_planta(
                 area=run.area, year=run.year, month=month
             )
@@ -170,9 +192,9 @@ def _scrape_planta(db: Session, scraper: PortalScraper, run: ScrapeRun, org_code
                 db.add(pla)
                 count += 1
             db.commit()
-            logger.info(f"Planta month {month}: {len(records)} records")
+            logger.info(f"Planta month {month}: {len(records)} records loaded")
         except Exception as e:
-            logger.error(f"Error scraping planta month {month}: {e}")
+            logger.error(f"Error scraping planta month {month}: {e}", exc_info=True)
             db.rollback()
     return count
 
@@ -182,7 +204,7 @@ def _scrape_escalas(db: Session, scraper: PortalScraper, run: ScrapeRun, org_cod
         scraper.scrape_escalas(year=run.year)
         logger.info("Escalas downloaded")
     except Exception as e:
-        logger.error(f"Error scraping escalas: {e}")
+        logger.error(f"Error scraping escalas: {e}", exc_info=True)
 
 
 def _parse_float(val) -> float | None:

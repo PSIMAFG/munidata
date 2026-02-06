@@ -1,9 +1,13 @@
+import logging
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.schemas.filters import DashboardFilters
 from app.services.dashboard_service import get_kpis, get_timeseries, get_breakdown
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -35,7 +39,14 @@ async def dashboard_kpis(
     filters: DashboardFilters = Depends(_parse_filters),
     db: AsyncSession = Depends(get_db),
 ):
-    return await get_kpis(db, filters)
+    try:
+        return await get_kpis(db, filters)
+    except Exception as e:
+        logger.exception("Error fetching KPIs")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Error al obtener KPIs: {str(e)}"},
+        )
 
 
 @router.get("/timeseries")
@@ -44,7 +55,14 @@ async def dashboard_timeseries(
     group_by: str = Query("month", enum=["month", "convenio", "vinculo"]),
     db: AsyncSession = Depends(get_db),
 ):
-    return await get_timeseries(db, filters, group_by)
+    try:
+        return await get_timeseries(db, filters, group_by)
+    except Exception as e:
+        logger.exception("Error fetching timeseries")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Error al obtener timeseries: {str(e)}"},
+        )
 
 
 @router.get("/breakdown")
@@ -54,4 +72,11 @@ async def dashboard_breakdown(
     top_n: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
 ):
-    return await get_breakdown(db, filters, group_by, top_n)
+    try:
+        return await get_breakdown(db, filters, group_by, top_n)
+    except Exception as e:
+        logger.exception("Error fetching breakdown")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Error al obtener breakdown: {str(e)}"},
+        )

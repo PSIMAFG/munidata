@@ -1,6 +1,6 @@
 """Server-side aggregation service for dashboard endpoints."""
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, and_, or_, cast, Float
+from sqlalchemy import select, func, case, and_, or_, cast, Float, literal
 from app.models.personnel import HonorariosRecord, ContrataRecord, PlantaRecord
 from app.schemas.filters import DashboardFilters
 from typing import Any
@@ -127,7 +127,7 @@ async def get_timeseries(
     if "HONORARIOS" in f.contract_types:
         group_col = (
             HonorariosRecord.convenio if group_by == "convenio"
-            else func.literal("HONORARIOS")
+            else literal("HONORARIOS")
         )
         q = (
             select(
@@ -153,7 +153,7 @@ async def get_timeseries(
         q = (
             select(
                 ContrataRecord.month,
-                func.literal("CONTRATA").label("group_key"),
+                literal("CONTRATA").label("group_key"),
                 func.coalesce(func.sum(ContrataRecord.remuneracion_bruta), 0).label("total"),
                 func.count(ContrataRecord.id).label("count"),
             )
@@ -174,7 +174,7 @@ async def get_timeseries(
         q = (
             select(
                 PlantaRecord.month,
-                func.literal("PLANTA").label("group_key"),
+                literal("PLANTA").label("group_key"),
                 func.coalesce(func.sum(PlantaRecord.remuneracion_bruta), 0).label("total"),
                 func.count(PlantaRecord.id).label("count"),
             )

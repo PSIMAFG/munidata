@@ -368,38 +368,40 @@ class HTTPScraper:
         return records
 
     def _extract_table_headers(self, table: Tag) -> list[str]:
-        """Extract column headers from a table element."""
-        headers = []
+        """Extract column headers from a table element.
+
+        Accounts for colspan attributes to ensure header count matches
+        data cell count, preventing column shift bugs.
+        """
+        from app.scraper.column_mapping import extract_headers_with_colspan
 
         # Try <thead> <th>
         thead = table.find("thead")
         if thead:
-            for th in thead.find_all("th"):
-                headers.append(th.get_text(strip=True))
-            if headers:
-                return headers
+            ths = thead.find_all("th")
+            if ths:
+                return extract_headers_with_colspan(ths)
 
             # Try <thead> <td>
-            for td in thead.find_all("td"):
-                headers.append(td.get_text(strip=True))
-            if headers:
-                return headers
+            tds = thead.find_all("td")
+            if tds:
+                return extract_headers_with_colspan(tds)
 
         # Try first <tr> with <th> elements
         first_row = table.find("tr")
         if first_row:
             ths = first_row.find_all("th")
             if ths:
-                return [th.get_text(strip=True) for th in ths]
+                return extract_headers_with_colspan(ths)
             # First row with <td> as headers
             tds = first_row.find_all("td")
             if tds:
-                candidate = [td.get_text(strip=True) for td in tds]
+                candidate = extract_headers_with_colspan(tds)
                 # Check if first row looks like headers (contains text, not just numbers)
                 if any(not c.replace(".", "").replace(",", "").isdigit() for c in candidate if c):
                     return candidate
 
-        return headers
+        return []
 
     def _extract_table_rows(self, table: Tag, headers: list[str]) -> list[dict]:
         """Extract data rows from a table given headers."""
@@ -698,74 +700,24 @@ class HTTPScraper:
     # ------------------------------------------------------------------
 
     def _normalize_honorarios(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize raw honorarios records to standard field names."""
-        normalized = []
-        for raw in raw_records:
-            rec = {}
-            for key, val in raw.items():
-                k = key.lower().strip()
-                if "nombre" in k or "persona" in k:
-                    rec["nombre"] = val
-                elif k == "rut" or "rut" in k:
-                    rec["rut"] = val
-                elif "descripci" in k and "funci" in k:
-                    rec["descripcion_funcion"] = val
-                elif "calificaci" in k or "profesi" in k:
-                    rec["calificacion_profesional"] = val
-                elif "fecha" in k and "inicio" in k:
-                    rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
-                    rec["fecha_termino"] = val
-                elif "brut" in k and ("remun" in k or "renta" in k):
-                    rec["remuneracion_bruta"] = val
-                elif ("l" in k and "quid" in k) and ("remun" in k or "renta" in k):
-                    rec["remuneracion_liquida"] = val
-                elif "monto" in k or "total" in k:
-                    rec["monto_total"] = val
-                elif "observ" in k:
-                    rec["observaciones"] = val
-                elif "vi" in k and "tic" in k:
-                    rec["viatico"] = val
-                elif "unidad" in k or "monet" in k:
-                    rec["unidad_monetaria"] = val
-            normalized.append(rec)
-        return normalized
+        """Normalize raw honorarios records to standard field names.
+
+        Uses header-based alias matching (column_mapping module) instead of
+        fragile index/substring matching. This prevents column shift bugs
+        when the portal changes header order or naming.
+        """
+        from app.scraper.column_mapping import normalize_honorarios
+        return normalize_honorarios(raw_records)
 
     def _normalize_contrata_planta(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize contrata/planta records to standard field names."""
-        normalized = []
-        for raw in raw_records:
-            rec = {}
-            for key, val in raw.items():
-                k = key.lower().strip()
-                if "nombre" in k or "persona" in k:
-                    rec["nombre"] = val
-                elif k == "rut" or "rut" in k:
-                    rec["rut"] = val
-                elif "grado" in k or "eus" in k:
-                    rec["grado_eus"] = val
-                elif "cargo" in k:
-                    rec["cargo"] = val
-                elif "calificaci" in k or "profesi" in k:
-                    rec["calificacion_profesional"] = val
-                elif "regi" in k:
-                    rec["region"] = val
-                elif "asignaci" in k:
-                    rec["asignaciones"] = val
-                elif "brut" in k:
-                    rec["remuneracion_bruta"] = val
-                elif "l" in k and "quid" in k:
-                    rec["remuneracion_liquida"] = val
-                elif "fecha" in k and "inicio" in k:
-                    rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
-                    rec["fecha_termino"] = val
-                elif "observ" in k:
-                    rec["observaciones"] = val
-                elif "hora" in k:
-                    rec["horas"] = val
-            normalized.append(rec)
-        return normalized
+        """Normalize contrata/planta records to standard field names.
+
+        Uses header-based alias matching (column_mapping module) instead of
+        fragile index/substring matching. This prevents column shift bugs
+        when the portal changes header order or naming.
+        """
+        from app.scraper.column_mapping import normalize_contrata_planta
+        return normalize_contrata_planta(raw_records)
 
     # ------------------------------------------------------------------
     # Main scraping orchestration (multi-level strategy)

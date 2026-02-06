@@ -2,7 +2,8 @@ import axios from 'axios';
 import type {
   DashboardFilters, KPIs, TimeseriesRow, BreakdownRow,
   PaginatedResponse, HonorariosRecord, ContrataPlantaRecord,
-  FilterOptions, AuditSummary, AuditExceptionRow, ScrapeRun
+  FilterOptions, AuditSummary, AuditExceptionRow, ScrapeRun,
+  Project, ProjectDeleteResult
 } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
@@ -148,4 +149,54 @@ export function getExportCSVUrl(f: DashboardFilters, contract_type: string): str
 export function getExportExcelUrl(f: DashboardFilters): string {
   const params = new URLSearchParams(filtersToParams(f));
   return `${API_BASE}/api/export/excel?${params}`;
+}
+
+// --- Projects ---
+
+export async function fetchProjects(): Promise<Project[]> {
+  const { data } = await api.get('/api/projects');
+  return data;
+}
+
+export async function fetchProject(id: number): Promise<Project> {
+  const { data } = await api.get(`/api/projects/${id}`);
+  return data;
+}
+
+export async function createProject(req: {
+  name: string;
+  description?: string;
+  municipality_code: string;
+  area?: string;
+  year?: number;
+  months?: number[];
+  contract_types?: string[];
+  convenios?: string[];
+}): Promise<Project> {
+  const { data } = await api.post('/api/projects', req);
+  return data;
+}
+
+export async function updateProject(id: number, req: {
+  name?: string;
+  description?: string;
+  municipality_code?: string;
+  area?: string;
+  year?: number;
+  months?: number[];
+  contract_types?: string[];
+  convenios?: string[];
+}): Promise<Project> {
+  const { data } = await api.put(`/api/projects/${id}`, req);
+  return data;
+}
+
+export async function deleteProject(id: number): Promise<{ detail: string }> {
+  const { data } = await api.delete(`/api/projects/${id}`);
+  return data;
+}
+
+export async function deleteProjectData(id: number): Promise<ProjectDeleteResult> {
+  const { data } = await api.delete(`/api/projects/${id}/data`);
+  return data;
 }

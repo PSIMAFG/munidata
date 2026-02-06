@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
-from app.api import health, dashboard, records, scrape, audit, export, filters
+from app.api import health, dashboard, records, scrape, audit, export, filters, projects
 
 
 @asynccontextmanager
@@ -34,3 +34,4 @@ app.include_router(scrape.router, prefix="/api", tags=["scrape"])
 app.include_router(audit.router, prefix="/api/audit", tags=["audit"])
 app.include_router(export.router, prefix="/api/export", tags=["export"])
 app.include_router(filters.router, prefix="/api/filters", tags=["filters"])
+app.include_router(projects.router, prefix="/api/projects", tags=["projects"])

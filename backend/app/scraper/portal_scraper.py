@@ -383,30 +383,46 @@ class PortalScraper:
         return None
 
     def _extract_headers(self, table: Locator) -> list[str]:
-        """Extract column headers from a table."""
+        """Extract column headers from a table.
+
+        Accounts for colspan attributes to ensure header count matches
+        data cell count, preventing column shift bugs.
+        """
         headers = []
+
+        def _extract_with_colspan(locator: Locator) -> list[str]:
+            """Extract headers from a Playwright Locator, expanding colspan."""
+            result = []
+            for i in range(locator.count()):
+                cell = locator.nth(i)
+                text = cell.inner_text().strip()
+                try:
+                    colspan = int(cell.get_attribute("colspan") or "1")
+                except (ValueError, TypeError):
+                    colspan = 1
+                result.append(text)
+                for j in range(1, colspan):
+                    result.append(f"{text} ({j + 1})")
+            return result
 
         # Try <thead> <th>
         ths = table.locator("thead th")
         if ths.count() > 0:
-            for i in range(ths.count()):
-                headers.append(ths.nth(i).inner_text().strip())
+            headers = _extract_with_colspan(ths)
             if headers:
                 return headers
 
         # Try <thead> <td>
         tds = table.locator("thead td")
         if tds.count() > 0:
-            for i in range(tds.count()):
-                headers.append(tds.nth(i).inner_text().strip())
+            headers = _extract_with_colspan(tds)
             if headers:
                 return headers
 
         # Try first <tr> cells as headers
         first_row = table.locator("tr").first
         cells = first_row.locator("th, td")
-        for i in range(cells.count()):
-            headers.append(cells.nth(i).inner_text().strip())
+        headers = _extract_with_colspan(cells)
 
         return headers
 
@@ -642,36 +658,56 @@ class PortalScraper:
         return None
 
     def _extract_from_raw_html(self) -> list[dict]:
-        """Fallback: parse table data directly from page HTML source."""
+        """Fallback: parse table data directly from page HTML source.
+
+        Uses BeautifulSoup for robust HTML parsing, including colspan
+        handling to prevent column shift bugs.
+        """
         try:
+            from bs4 import BeautifulSoup
+            from app.scraper.column_mapping import extract_headers_with_colspan
+
             html = self.page.content()
-            # Find all tables in the HTML
-            table_pattern = re.compile(r'<table[^>]*>(.*?)</table>', re.DOTALL | re.IGNORECASE)
-            tables = table_pattern.findall(html)
+            soup = BeautifulSoup(html, "html.parser")
+            tables = soup.find_all("table")
 
-            for table_html in tables:
-                # Extract headers
-                header_pattern = re.compile(r'<th[^>]*>(.*?)</th>', re.DOTALL | re.IGNORECASE)
-                headers_raw = header_pattern.findall(table_html)
-                headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers_raw]
+            for table in tables:
+                # Extract headers with colspan support
+                thead = table.find("thead")
+                header_cells = []
+                if thead:
+                    header_cells = thead.find_all("th") or thead.find_all("td")
+                if not header_cells:
+                    first_row = table.find("tr")
+                    if first_row:
+                        header_cells = first_row.find_all("th")
+                        if not header_cells:
+                            header_cells = first_row.find_all("td")
 
+                if not header_cells:
+                    continue
+
+                headers = extract_headers_with_colspan(header_cells)
                 if len(headers) < 3:
                     continue
 
-                # Extract rows
-                row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
-                cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
-                rows = row_pattern.findall(table_html)
+                # Extract data rows
+                tbody = table.find("tbody")
+                if tbody:
+                    rows = tbody.find_all("tr")
+                else:
+                    all_rows = table.find_all("tr")
+                    rows = all_rows[1:]  # skip header row
 
                 records = []
-                for row_html in rows:
-                    cells_raw = cell_pattern.findall(row_html)
-                    cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells_raw]
-                    if len(cells) >= len(headers) and any(cells):
+                for row in rows:
+                    cells = row.find_all("td")
+                    cell_texts = [c.get_text(strip=True) for c in cells]
+                    if len(cell_texts) >= len(headers) and any(cell_texts):
                         record = {}
                         for j, header in enumerate(headers):
-                            if j < len(cells):
-                                record[header] = cells[j]
+                            if j < len(cell_texts):
+                                record[header] = cell_texts[j]
                         records.append(record)
 
                 if len(records) > 2:
@@ -705,87 +741,24 @@ class PortalScraper:
     # ------------------------------------------------------------------
 
     def _normalize_honorarios(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize raw honorarios records to standard field names."""
-        normalized = []
-        for raw in raw_records:
-            rec = {}
-            for key, val in raw.items():
-                k = key.lower().strip()
-                if "nombre" in k or "persona" in k:
-                    rec["nombre"] = val
-                elif k == "rut" or "rut" in k:
-                    rec["rut"] = val
-                elif "descripci" in k and "funci" in k:
-                    rec["descripcion_funcion"] = val
-                elif "calificaci" in k or "profesi" in k:
-                    rec["calificacion_profesional"] = val
-                elif "fecha" in k and "inicio" in k:
-                    rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
-                    rec["fecha_termino"] = val
-                elif "brut" in k:
-                    # Matches "honorario total bruto mensualizado",
-                    # "remuneración bruta", "renta bruta", etc.
-                    rec["remuneracion_bruta"] = val
-                elif "quid" in k:
-                    # Matches "remuneración líquida", "renta líquida", etc.
-                    rec["remuneracion_liquida"] = val
-                elif "monto" in k or ("total" in k and "brut" not in k):
-                    rec["monto_total"] = val
-                elif "observ" in k:
-                    rec["observaciones"] = val
-                elif "vi" in k and "tic" in k:
-                    rec["viatico"] = val
-                elif "unidad" in k or "monet" in k:
-                    rec["unidad_monetaria"] = val
-            normalized.append(rec)
-        return normalized
+        """Normalize raw honorarios records to standard field names.
+
+        Uses header-based alias matching (column_mapping module) instead of
+        fragile index/substring matching. This prevents column shift bugs
+        when the portal changes header order or naming.
+        """
+        from app.scraper.column_mapping import normalize_honorarios
+        return normalize_honorarios(raw_records)
 
     def _normalize_contrata_planta(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize contrata/planta records to standard field names."""
-        normalized = []
-        for raw in raw_records:
-            # Pre-scan: identify bruta and líquida keys to avoid ambiguity
-            bruta_key = None
-            liquida_key = None
-            for key in raw:
-                k = key.lower().strip()
-                if "brut" in k:
-                    bruta_key = key
-                elif "quid" in k:
-                    liquida_key = key
+        """Normalize contrata/planta records to standard field names.
 
-            rec = {}
-            for key, val in raw.items():
-                k = key.lower().strip()
-                if "nombre" in k or "persona" in k:
-                    rec["nombre"] = val
-                elif k == "rut" or "rut" in k:
-                    rec["rut"] = val
-                elif "grado" in k or "eus" in k:
-                    rec["grado_eus"] = val
-                elif "cargo" in k:
-                    rec["cargo"] = val
-                elif "calificaci" in k or "profesi" in k:
-                    rec["calificacion_profesional"] = val
-                elif "regi" in k:
-                    rec["region"] = val
-                elif "asignaci" in k:
-                    rec["asignaciones"] = val
-                elif key == bruta_key:
-                    rec["remuneracion_bruta"] = val
-                elif key == liquida_key:
-                    rec["remuneracion_liquida"] = val
-                elif "fecha" in k and "inicio" in k:
-                    rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
-                    rec["fecha_termino"] = val
-                elif "observ" in k:
-                    rec["observaciones"] = val
-                elif "hora" in k:
-                    rec["horas"] = val
-            normalized.append(rec)
-        return normalized
+        Uses header-based alias matching (column_mapping module) instead of
+        fragile index/substring matching. This prevents column shift bugs
+        when the portal changes header order or naming.
+        """
+        from app.scraper.column_mapping import normalize_contrata_planta
+        return normalize_contrata_planta(raw_records)
 
     # ------------------------------------------------------------------
     # Scrape with retry logic (Level 3: resilience)

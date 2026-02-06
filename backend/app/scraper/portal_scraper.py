@@ -140,7 +140,16 @@ class PortalScraper:
         return []
 
     def _normalize_honorarios(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize raw honorarios records to standard field names."""
+        """Normalize raw honorarios records to standard field names.
+
+        Portal columns (actual names from transparencia):
+          Año, Mes, Nombre completo, Grado EUS (si corresponde),
+          Descripción de la función, Calificación profesional o formación,
+          Región, **Honorario Total Bruto Mensualizado**,
+          Remuneración líquida mensualizada, Tipo de pago, Descripción pago,
+          Número de cuotas, Fecha de inicio, Fecha de término,
+          Observaciones, Enlace funciones desarrolladas, Viáticos
+        """
         normalized = []
         for raw in raw_records:
             rec = {}
@@ -152,32 +161,64 @@ class PortalScraper:
                     rec["rut"] = val
                 elif "descripci" in k and "funci" in k:
                     rec["descripcion_funcion"] = val
-                elif "calificaci" in k or "profesi" in k:
+                elif "calificaci" in k or "profesi" in k or "formaci" in k:
                     rec["calificacion_profesional"] = val
                 elif "fecha" in k and "inicio" in k:
                     rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
+                elif "fecha" in k and "rmino" in k:
                     rec["fecha_termino"] = val
-                elif "brut" in k and ("remun" in k or "renta" in k):
+                # "Honorario Total Bruto Mensualizado" - primary for honorarios
+                elif "honorario" in k and "brut" in k:
                     rec["remuneracion_bruta"] = val
-                elif ("l" in k and "quid" in k) and ("remun" in k or "renta" in k):
+                # "Remuneración bruta" generic fallback
+                elif "brut" in k and "remun" in k:
+                    rec.setdefault("remuneracion_bruta", val)
+                # Any column with "brut" that hasn't been captured yet
+                elif "brut" in k and "remuneracion_bruta" not in rec:
+                    rec["remuneracion_bruta"] = val
+                # "Remuneración líquida mensualizada"
+                elif "quid" in k:
                     rec["remuneracion_liquida"] = val
-                elif "monto" in k or "total" in k:
-                    rec["monto_total"] = val
                 elif "observ" in k:
                     rec["observaciones"] = val
                 elif "vi" in k and "tic" in k:
                     rec["viatico"] = val
-                elif "unidad" in k or "monet" in k:
-                    rec["unidad_monetaria"] = val
+                elif "grado" in k:
+                    rec["grado_eus"] = val
+                elif "regi" in k and "regi" in k:
+                    rec["region"] = val
+            # Copy bruta to monto_total for honorarios
+            if "remuneracion_bruta" in rec:
+                rec["monto_total"] = rec["remuneracion_bruta"]
             normalized.append(rec)
         return normalized
 
     def _normalize_contrata_planta(self, raw_records: list[dict]) -> list[dict]:
-        """Normalize contrata/planta records."""
+        """Normalize contrata/planta records.
+
+        Portal columns (actual names from transparencia):
+          Año, Mes, Nombre Completo, Grado EUS, Cargo o Función,
+          Calificación Profesional, Región,
+          **Remuneración bruta del mes (incluye bonos e incentivos, asig. especiales, horas extras)**,
+          Remuneración líquida del mes, Asignaciones especiales,
+          Fecha de inicio, Fecha de término, Observaciones, Horas extras
+
+        IMPORTANT: "bruta" must be checked BEFORE "líquida" to avoid mis-mapping.
+        The bruta column contains the full cost to the service.
+        """
         normalized = []
         for raw in raw_records:
             rec = {}
+            # First pass: identify bruta and liquida columns by exact header matching
+            bruta_key = None
+            liquida_key = None
+            for key in raw.keys():
+                k = key.lower().strip()
+                if "brut" in k:
+                    bruta_key = key
+                elif "quid" in k:
+                    liquida_key = key
+
             for key, val in raw.items():
                 k = key.lower().strip()
                 if "nombre" in k or "persona" in k:
@@ -186,24 +227,26 @@ class PortalScraper:
                     rec["rut"] = val
                 elif "grado" in k or "eus" in k:
                     rec["grado_eus"] = val
-                elif "cargo" in k:
+                elif "cargo" in k or ("funci" in k and "descripci" not in k):
                     rec["cargo"] = val
-                elif "calificaci" in k or "profesi" in k:
+                elif "calificaci" in k or "profesi" in k or "formaci" in k:
                     rec["calificacion_profesional"] = val
                 elif "regi" in k:
                     rec["region"] = val
-                elif "asignaci" in k:
+                elif "asignaci" in k or "especial" in k:
                     rec["asignaciones"] = val
-                elif "brut" in k:
+                elif key == bruta_key:
                     rec["remuneracion_bruta"] = val
-                elif "l" in k and "quid" in k:
+                elif key == liquida_key:
                     rec["remuneracion_liquida"] = val
                 elif "fecha" in k and "inicio" in k:
                     rec["fecha_inicio"] = val
-                elif "fecha" in k and ("t" in k and "rmino" in k):
+                elif "fecha" in k and "rmino" in k:
                     rec["fecha_termino"] = val
                 elif "observ" in k:
                     rec["observaciones"] = val
+                elif "hora" in k and "extra" in k:
+                    rec["horas"] = val
                 elif "hora" in k:
                     rec["horas"] = val
             normalized.append(rec)

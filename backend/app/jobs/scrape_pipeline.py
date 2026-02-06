@@ -186,12 +186,28 @@ def _scrape_escalas(db: Session, scraper: PortalScraper, run: ScrapeRun, org_cod
 
 
 def _parse_float(val) -> float | None:
+    """Parse Chilean currency format to float.
+
+    Handles: '$ 41.712', '$41.712', '1.234.567', '41712', '1234,56', empty strings.
+    Chilean format uses '.' as thousand separator and ',' as decimal separator.
+    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
     try:
-        cleaned = str(val).replace(".", "").replace(",", ".").replace("$", "").strip()
+        cleaned = str(val).strip()
+        if not cleaned or cleaned.lower() in ("", "-", "no informa", "no aplica"):
+            return None
+        # Remove currency symbol and spaces
+        cleaned = cleaned.replace("$", "").replace("\xa0", "").strip()
+        # Chilean format: '.' is thousands, ',' is decimal
+        # If there's a comma, it's a decimal separator
+        if "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            # Only dots = thousand separators (e.g. "1.234.567")
+            cleaned = cleaned.replace(".", "")
         return float(cleaned) if cleaned else None
     except (ValueError, TypeError):
         return None

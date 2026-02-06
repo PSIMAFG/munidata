@@ -14,8 +14,11 @@ CONVENIO_PATTERNS: list[tuple[str, str]] = [
     (r"(?i)\bCESFAM\b", "CESFAM"),
     (r"(?i)\bSAR\b", "SAR"),
     (r"(?i)\bSAPU\b", "SAPU"),
+    (r"(?i)\bAIDIA\b", "AIDIA"),
     (r"(?i)\bPROGRAMA\s+DE\s+SALUD\s+MENTAL\b", "SALUD MENTAL"),
     (r"(?i)\bSALUD\s*MENTAL\b", "SALUD MENTAL"),
+    (r"(?i)\bESTRATEGIAS?\s+DE\s+SALUD\s+BUCAL\b", "SALUD BUCAL"),
+    (r"(?i)\bSALUD\s*BUCAL\b", "SALUD BUCAL"),
     (r"(?i)\bSSR\b", "SSR"),
     (r"(?i)\bPROGRAMA\s+CARDIOVASCULAR\b", "CARDIOVASCULAR"),
     (r"(?i)\bCARDIOVASCULAR\b", "CARDIOVASCULAR"),
@@ -37,6 +40,13 @@ CONVENIO_PATTERNS: list[tuple[str, str]] = [
     (r"(?i)\bFLEXIFOND[OI]\b", "FLEXIFONDO"),
     (r"(?i)\bRESOLUCI[OÓ]N\b", "RESOLUCION"),
     (r"(?i)\bCONVENIO\s+(.+?)(?:\.|$)", None),  # Generic "Convenio X" -> X
+    # "Honorarios Convenio Programa X", "Honorarios Convenio X",
+    # "Honorarios Programa X" variants
+    (r"(?i)\bHonorarios\s+Convenio\s+Programa\s+(.+?)$", None),
+    (r"(?i)\bHonorarios\s+Convenio\s+(.+?)$", None),
+    (r"(?i)\bHonorarios\s+Programa\s+(.+?)$", None),
+    # Generic catch-all: "Honorarios {ANYTHING}" -> captured as convenio name
+    (r"(?i)\bHonorarios\s+(.+?)$", None),
 ]
 
 _compiled_patterns = [(re.compile(p), name) for p, name in CONVENIO_PATTERNS]

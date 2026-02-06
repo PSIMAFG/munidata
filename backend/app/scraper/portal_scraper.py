@@ -723,11 +723,14 @@ class PortalScraper:
                     rec["fecha_inicio"] = val
                 elif "fecha" in k and ("t" in k and "rmino" in k):
                     rec["fecha_termino"] = val
-                elif "brut" in k and ("remun" in k or "renta" in k):
+                elif "brut" in k:
+                    # Matches "honorario total bruto mensualizado",
+                    # "remuneración bruta", "renta bruta", etc.
                     rec["remuneracion_bruta"] = val
-                elif ("l" in k and "quid" in k) and ("remun" in k or "renta" in k):
+                elif "quid" in k:
+                    # Matches "remuneración líquida", "renta líquida", etc.
                     rec["remuneracion_liquida"] = val
-                elif "monto" in k or "total" in k:
+                elif "monto" in k or ("total" in k and "brut" not in k):
                     rec["monto_total"] = val
                 elif "observ" in k:
                     rec["observaciones"] = val
@@ -742,6 +745,16 @@ class PortalScraper:
         """Normalize contrata/planta records to standard field names."""
         normalized = []
         for raw in raw_records:
+            # Pre-scan: identify bruta and líquida keys to avoid ambiguity
+            bruta_key = None
+            liquida_key = None
+            for key in raw:
+                k = key.lower().strip()
+                if "brut" in k:
+                    bruta_key = key
+                elif "quid" in k:
+                    liquida_key = key
+
             rec = {}
             for key, val in raw.items():
                 k = key.lower().strip()
@@ -759,9 +772,9 @@ class PortalScraper:
                     rec["region"] = val
                 elif "asignaci" in k:
                     rec["asignaciones"] = val
-                elif "brut" in k:
+                elif key == bruta_key:
                     rec["remuneracion_bruta"] = val
-                elif "l" in k and "quid" in k:
+                elif key == liquida_key:
                     rec["remuneracion_liquida"] = val
                 elif "fecha" in k and "inicio" in k:
                     rec["fecha_inicio"] = val

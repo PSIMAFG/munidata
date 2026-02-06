@@ -304,13 +304,20 @@ def _scrape_escalas(db: Session, scraper, run: ScrapeRun, org_code: str):
         logger.error(f"Error scraping escalas: {e}", exc_info=True)
 
 
+_NON_NUMERIC = {"", "-", "--", "no informa", "no aplica", "n/a", "s/i"}
+
+
 def _parse_float(val) -> float | None:
     if val is None:
         return None
     if isinstance(val, (int, float)):
         return float(val)
     try:
-        cleaned = str(val).replace(".", "").replace(",", ".").replace("$", "").strip()
+        cleaned = str(val).replace("$", "").replace(" ", "").strip()
+        if cleaned.lower() in _NON_NUMERIC:
+            return None
+        # Chilean format: dots as thousands separator, comma as decimal
+        cleaned = cleaned.replace(".", "").replace(",", ".")
         return float(cleaned) if cleaned else None
     except (ValueError, TypeError):
         return None
